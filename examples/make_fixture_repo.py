@@ -4,7 +4,8 @@
 Creates a small git repository in a known mid-session state:
 
 - branch ``feature/handoff-fixture``
-- an old commit (dated 2026-10-11, outside the default window)
+- an old commit (dated 3 days before the demo repo is built,
+  outside the default window)
 - two recent commits (inside the window)
 - one staged change, one unstaged change, one untracked file
 - one stash entry
@@ -23,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ENV = {
@@ -75,7 +77,11 @@ def main() -> int:
           'if __name__ == "__main__":\n'
           "    main()\n")
     write(target, "config.txt", "mode=fixture\n")
-    commit(target, "Initial import", when="2026-10-11T10:00:00")
+    # Relative to build time, never a fixed date: a hard-coded "old"
+    # date ages out of every window the walkthrough demonstrates.
+    old_when = (datetime.now() - timedelta(days=3)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+    commit(target, "Initial import", when=old_when)
 
     write(target, "pricing.py",
           '"""Pricing helpers."""\n\n'

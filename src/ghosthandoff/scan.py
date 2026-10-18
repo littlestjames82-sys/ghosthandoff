@@ -3,6 +3,16 @@
 Both are pure reads: marker lines are quoted (redacted, truncated),
 reports are summarised from what is already on disk. Nothing in the
 described project is executed, ever.
+
+- :func:`scan_markers` finds TODO / FIXME / XXX / HACK markers and
+  splits them into code context (counts as open loops) versus
+  documentation / fixture context (listed, but not a loop); see
+  :func:`marker_context`.
+- :func:`discover_reports` finds known Ghost tool report files
+  (GhostVerify, GhostBench, GhostSlice ledger and bundles, pytest
+  last-failed cache) and summarises each from its contents and
+  modification time. Results stored anywhere else are missed by
+  design, and the pack's coverage note says so.
 """
 from __future__ import annotations
 
@@ -28,8 +38,29 @@ FIXTURE_DIRS = {"fixtures", "fixture", "testdata", "test_data", "__fixtures__"}
 DOCS_EXTS = {".md", ".markdown", ".rst", ".adoc"}
 
 
+def _contained_file(project: str, rel: str) -> str | None:
+    """Resolved full path for a project-relative file, or None when the
+    resolved path escapes the project tree. A symlink planted inside
+    the project must not let a scan or a report read quote a file that
+    is not part of the project. Both sides are resolved, so a project
+    reached through a symlink itself still works."""
+    root = os.path.realpath(project)
+    full = os.path.realpath(os.path.join(project, rel))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    if not os.path.isfile(full):
+        return None
+    return full
+
+
 def marker_context(rel: str) -> str:
-    """Classify a project-relative path as ``"code"`` or ``"docs"``."""
+    """Classify a project-relative path as ``"code"`` or ``"docs"``.
+
+    ``"docs"`` means a docs / fixture directory segment or a
+    documentation file extension (``.md``, ``.rst``, and kin);
+    everything else is ``"code"``. Only code-context markers count
+    as open loops.
+    """
     parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")]
     for seg in parts[:-1]:
         low = seg.lower()
@@ -42,7 +73,15 @@ def marker_context(rel: str) -> str:
 
 def scan_markers(project: str, files: list[str], max_markers: int = 200,
                  max_files: int = 20000) -> dict:
-    """Scan ``files`` (relative to project) for TODO/FIXME/XXX/HACK markers."""
+    """Scan ``files`` (relative to project) for TODO/FIXME/XXX/HACK markers.
+
+    Skips files over 512 KB and files that look binary. Returns
+    totals overall and split by kind and by context (``code_*`` vs
+    ``docs_*``), the capped ``items`` list (each with ``file``,
+    ``line``, ``kind``, ``context``, and redacted ``text``), and
+    truncation flags for both the marker list and the file list, so
+    a capped scan is visible in the pack rather than silent.
+    """
     items: list[dict] = []
     total = 0
     by_kind: dict[str, int] = {}
@@ -52,9 +91,11 @@ def scan_markers(project: str, files: list[str], max_markers: int = 200,
     docs_by_kind: dict[str, int] = {}
     scanned = 0
     for rel in files[:max_files]:
-        full = os.path.join(project, rel)
+        full = _contained_file(project, rel)
+        if full is None:
+            continue
         try:
-            if not os.path.isfile(full) or os.path.getsize(full) > MAX_FILE_BYTES:
+            if os.path.getsize(full) > MAX_FILE_BYTES:
                 continue
             with open(full, "rb") as fh:
                 raw = fh.read()
@@ -103,6 +144,7 @@ def scan_markers(project: str, files: list[str], max_markers: int = 200,
 
 
 def _iso_mtime(path: str) -> str:
+    """ISO-8601 modification time of ``path``, or ``""`` if unreadable."""
     try:
         return datetime.fromtimestamp(os.path.getmtime(path)).astimezone().isoformat(timespec="seconds")
     except OSError:
@@ -110,6 +152,7 @@ def _iso_mtime(path: str) -> str:
 
 
 def _read_json(path: str):
+    """Parse ``path`` as JSON, returning ``None`` on any read/parse error."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             return json.load(fh)
@@ -118,6 +161,7 @@ def _read_json(path: str):
 
 
 def _first_verdict_line(path: str) -> str:
+    """First non-blank line of ``path``, redacted and truncated (or ``""``)."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for ln in fh:
@@ -129,7 +173,18 @@ def _first_verdict_line(path: str) -> str:
 
 
 def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
-    """Find verification evidence already on disk. Summaries only."""
+    """Find verification evidence already on disk. Summaries only.
+
+    Looks for, in the project root unless noted: ``verify-report.json``
+    and ``VERIFY.md`` (GhostVerify), a GhostBench report file, the
+    ``.ghostslice-history.jsonl`` ledger, the pytest
+    ``.pytest_cache`` last-failed file, and GhostSlice bundle folders
+    (a ``manifest.json`` in the top two levels, capped at
+    ``max_bundles``). Each result is ``{"kind", "path", "modified",
+    "summary"}`` plus kind-specific extras such as ``verdict`` or
+    ``failing_count``, sorted by path. Nothing is executed or
+    re-run; a report's age is part of its summary.
+    """
     reports: list[dict] = []
 
     def add(kind: str, rel: str, summary: str, extra: dict | None = None):
@@ -144,8 +199,8 @@ def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
         reports.append(entry)
 
     # GhostVerify machine verdict
-    vr = os.path.join(project, "verify-report.json")
-    if os.path.isfile(vr):
+    vr = _contained_file(project, "verify-report.json")
+    if vr is not None:
         data = _read_json(vr)
         verdict = None
         if isinstance(data, dict):
@@ -153,19 +208,24 @@ def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
                 if key in data:
                     verdict = data[key]
                     break
+        if isinstance(verdict, str):
+            # The verdict is quoted verbatim into both pack files (the
+            # report entry and the open-loop detail), so it goes
+            # through the same redaction pass as every other quote.
+            verdict = clean_line(verdict, 80)
         summary = f"verdict field: {verdict}" if verdict is not None else "present, no verdict field parsed"
         add("ghostverify-report", "verify-report.json", clean_line(summary, 160),
             {"verdict": verdict})
 
     # GhostVerify human report
-    vm = os.path.join(project, "VERIFY.md")
-    if os.path.isfile(vm):
+    vm = _contained_file(project, "VERIFY.md")
+    if vm is not None:
         add("ghostverify-md", "VERIFY.md", _first_verdict_line(vm))
 
     # GhostBench report (any of the common names, root level)
     for name in ("bench-report.json", "BENCH.md", "bench-results.json"):
-        p = os.path.join(project, name)
-        if os.path.isfile(p):
+        p = _contained_file(project, name)
+        if p is not None:
             if name.endswith(".json"):
                 data = _read_json(p)
                 keys = sorted(data.keys())[:6] if isinstance(data, dict) else []
@@ -176,8 +236,8 @@ def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
             break
 
     # GhostSlice history ledger tail
-    ledger = os.path.join(project, ".ghostslice-history.jsonl")
-    if os.path.isfile(ledger):
+    ledger = _contained_file(project, ".ghostslice-history.jsonl")
+    if ledger is not None:
         last = ""
         count = 0
         try:
@@ -194,8 +254,9 @@ def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
             clean_line(f"{count} entries; last entry keys: " + ", ".join(keys), 160))
 
     # pytest lastfailed cache: counts only, recorded failures from the last run
-    lf = os.path.join(project, ".pytest_cache", "v", "cache", "lastfailed")
-    if os.path.isfile(lf):
+    lf = _contained_file(project, os.path.join(
+        ".pytest_cache", "v", "cache", "lastfailed"))
+    if lf is not None:
         data = _read_json(lf)
         n = len(data) if isinstance(data, dict) else 0
         add("pytest-lastfailed", ".pytest_cache/v/cache/lastfailed",
@@ -220,7 +281,10 @@ def discover_reports(project: str, max_bundles: int = 20) -> list[dict]:
     except OSError:
         pass
     for rel in bundles[:max_bundles]:
-        data = _read_json(os.path.join(project, rel, "manifest.json"))
+        manifest = _contained_file(project, os.path.join(rel, "manifest.json"))
+        if manifest is None:
+            continue  # bundle folder is a symlink out of the project
+        data = _read_json(manifest)
         files_n = None
         if isinstance(data, dict):
             files_field = data.get("files")

@@ -3,6 +3,17 @@
 Every sentence in HANDOFF.md is a fixed template filled from a measured
 fact in handoff.json. The two files are rendered from the same dict, so
 their numbers cannot disagree.
+
+Pipeline (all steps are pure reads of the described project):
+
+1. :func:`build_pack_data` collects git facts, scans markers, and
+   discovers verification reports already on disk.
+2. :func:`derive_open_loops` turns those facts (and only those
+   facts) into open loops, each carrying a ``source`` string.
+3. :func:`derive_next_steps` drafts one templated next step per
+   loop, in a fixed priority order.
+4. :func:`render_markdown` / :func:`write_pack` render and write
+   the two pack files, in the output directory only.
 """
 from __future__ import annotations
 
@@ -27,10 +38,40 @@ def _verdict_is_failing(verdict) -> bool:
 
 
 def derive_open_loops(data: dict) -> list[dict]:
+    """Derive open loops from collected facts only; invents nothing.
+
+    Each loop is ``{"kind", "detail", "source"}``: a stable kind tag,
+    a one-line human description built from the fact's counts, and
+    the source a reader can check (for example ``"git status"`` or
+    ``"verify-report.json"``). Recognised kinds include
+    ``uncommitted-changes``, ``untracked-files``,
+    ``unpushed-commits``, ``behind-upstream``, ``stash-entries``,
+    ``failing-verification``, ``recorded-test-failures``, and
+    ``open-markers`` (code-context markers only; see the note on the
+    marker branch below).
+    """
     loops: list[dict] = []
     git = data.get("git") or {}
     if git.get("available"):
         st = git["status"]
+        for op in git.get("operations", []):
+            loops.append({
+                "kind": "in-progress-operation",
+                "detail": f"a git {op['operation']} is in progress "
+                          f"(marker {op['source']} is present), so the working "
+                          "tree is in a mid-operation state",
+                "source": op["source"],
+            })
+        if st.get("unmerged_count"):
+            names = ", ".join(st.get("unmerged", [])[:10])
+            if st["unmerged_count"] > 10:
+                names += f", and {st['unmerged_count'] - 10} more"
+            loops.append({
+                "kind": "unmerged-files",
+                "detail": f"{st['unmerged_count']} file(s) have unresolved "
+                          f"merge conflicts: {names}",
+                "source": "git status",
+            })
         if st["staged_count"] or st["unstaged_count"]:
             loops.append({
                 "kind": "uncommitted-changes",
@@ -102,7 +143,19 @@ def derive_open_loops(data: dict) -> list[dict]:
 
 
 def derive_next_steps(data: dict) -> list[dict]:
-    """Templated drafts from the open loops, fixed priority order."""
+    """Draft next steps from the open loops, in fixed priority order.
+
+    Each step is ``{"text", "source"}``: a short template filled
+    from the loop it came from, plus that loop's source. The order
+    is deliberate and stable: in-progress git operation and its
+    unmerged files first, then failing verification, recorded test
+    failures, FIXME, TODO, other markers, uncommitted
+    work, untracked files, unpushed commits, behind-upstream, and
+    stash review last. With no open loops the result is empty, and
+    the pack states that no steps were derivable. Steps are
+    proposals for the next session to confirm; nothing here is
+    executed.
+    """
     steps: list[dict] = []
     loops = {lp["kind"]: lp for lp in data.get("open_loops", [])}
     git = data.get("git") or {}
@@ -120,6 +173,24 @@ def derive_next_steps(data: dict) -> list[dict]:
                 return it
         return None
 
+    if "in-progress-operation" in loops:
+        ops = git.get("operations", [])
+        names = ", ".join(op["operation"] for op in ops) or "operation"
+        steps.append({
+            "text": f"Finish or abort the in-progress git operation ({names}) before "
+                    "starting new work: the tree is mid-operation, so the other facts "
+                    "in this pack describe an unfinished state. Handoff never runs git "
+                    "operations; that call is yours.",
+            "source": ops[0]["source"] if ops else "git dir markers",
+        })
+    if "unmerged-files" in loops:
+        st = git["status"]
+        steps.append({
+            "text": f"Resolve the {st['unmerged_count']} unmerged file(s) "
+                    f"({', '.join(st.get('unmerged', [])[:10])}) as part of finishing "
+                    "that operation, or abort the operation to return to a clean state.",
+            "source": "git status",
+        })
     if "failing-verification" in loops:
         steps.append({
             "text": "Re-check verification: the latest recorded GhostVerify verdict is not "
@@ -192,7 +263,24 @@ def derive_next_steps(data: dict) -> list[dict]:
 
 def build_pack_data(project: str, since: str | None = None, base: str | None = None,
                     now: datetime | None = None) -> dict:
-    """Collect every fact and derive loops and steps. Pure reads."""
+    """Collect every fact and derive loops and steps. Pure reads.
+
+    Args:
+        project: Project directory to describe (never written to).
+        since: Session-window spec as accepted by ``--since`` (a
+            duration, ISO date/time, or git ref), or ``None`` for
+            the default last-12-hours window.
+        base: Optional git ref for extra ``base...HEAD`` diff stats.
+        now: Build moment; injectable so tests can pin the window.
+            Defaults to the current local time.
+
+    Returns:
+        The pack dict that becomes ``handoff.json`` (and, via
+        :func:`render_markdown`, ``HANDOFF.md``), with keys
+        ``tool``, ``version``, ``generated_at``, ``project``,
+        ``session_window``, ``git``, ``markers``, ``reports``,
+        ``limits``, ``open_loops``, and ``next_steps``.
+    """
     project = os.path.abspath(project)
     now = now or datetime.now().astimezone()
     window = resolve_window(project, since, now)
@@ -217,6 +305,10 @@ def build_pack_data(project: str, since: str | None = None, base: str | None = N
             "Markers in documentation and fixture files are listed and "
             "subtotalled, but only markers in code files count as open loops.",
             "Report discovery uses known Ghost tool file names and shapes only.",
+            "In-progress git operations are detected from git-dir marker files "
+            "(MERGE_HEAD, rebase-merge / rebase-apply, CHERRY_PICK_HEAD, "
+            "REVERT_HEAD, BISECT_LOG). A marker left behind by a crashed git "
+            "process would read as in progress.",
             "Quoted lines are truncated and passed through a secret-shape redaction pass.",
         ],
     }
@@ -226,6 +318,13 @@ def build_pack_data(project: str, since: str | None = None, base: str | None = N
 
 
 def render_markdown(data: dict) -> str:
+    """Render a pack dict (from :func:`build_pack_data`) as HANDOFF.md.
+
+    Sections, in order: State now; Changed this session;
+    Verification status; Open loops; Next steps; Markers; Coverage
+    and limits. Every count comes from ``data`` unchanged, which is
+    what keeps the Markdown and JSON packs in agreement.
+    """
     git = data.get("git") or {}
     markers = data.get("markers") or {}
     lines: list[str] = []
@@ -257,7 +356,20 @@ def render_markdown(data: dict) -> str:
         lines.append(
             f"- Working tree: {st['staged_count']} staged, {st['unstaged_count']} unstaged, "
             f"{st['untracked_count']} untracked"
+            + (f", {st['unmerged_count']} unmerged (conflicted)"
+               if st.get("unmerged_count") else "")
         )
+        for op in git.get("operations", []):
+            extra = ""
+            if op.get("head"):
+                extra = f", head {op['head'][:12]}"
+            elif op.get("branch"):
+                extra = f", branch {op['branch']}"
+            lines.append(f"- In-progress git operation: {op['operation']} "
+                         f"(source: {op['source']}{extra})")
+        if st.get("unmerged"):
+            lines.append("- Unmerged (conflicted) files: "
+                         + ", ".join(st["unmerged"]))
         lines.append(f"- Stash: {git.get('stash_count', 0)} entr"
                      f"{'y' if git.get('stash_count') == 1 else 'ies'}")
     else:
@@ -340,7 +452,14 @@ def render_markdown(data: dict) -> str:
 
 def write_pack(project: str, out_dir: str, since: str | None = None,
                base: str | None = None, force: bool = False) -> dict:
-    """Build the data, write HANDOFF.md + handoff.json into ``out_dir`` only."""
+    """Build the data, write HANDOFF.md + handoff.json into ``out_dir`` only.
+
+    Creates ``out_dir`` if needed. Unless ``force`` is true, raises
+    :class:`FileExistsError` when either pack file already exists
+    there, so a previous handoff is never silently overwritten.
+    Returns the pack dict with an added ``pack`` key holding the
+    output directory and the two file paths.
+    """
     import json
 
     data = build_pack_data(project, since=since, base=base)

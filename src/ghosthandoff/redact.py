@@ -65,6 +65,7 @@ REDACTED = "[redacted-secret-shape]"
 
 
 def _redact_aws_secret_lines(text: str) -> str:
+    """Redact bare 40-char tokens, but only on AWS-secret context lines."""
     lines = text.split("\n")
     for i, line in enumerate(lines):
         if _AWS_SECRET_CONTEXT.search(line):

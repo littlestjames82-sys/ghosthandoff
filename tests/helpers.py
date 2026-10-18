@@ -34,6 +34,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -126,7 +127,13 @@ MARKER_FILES = {
     "app.py": "FIXME: retry the pricing call on failure",
     "scratch.py": "TODO: decide whether this scratch file ships",
 }
-OLD_COMMIT_DATE = "2026-10-11T10:00:00"
+# The "old" commit is dated 3 days before the fixture is built:
+# outside the default 12h window, inside a --since 4d window. It is
+# computed relative to build time, never a fixed calendar date: a
+# hard-coded date rots as real time passes (the 2026-10-11 original
+# silently aged out of the 4d window a week after it was written).
+OLD_COMMIT_DATE = (datetime.now() - timedelta(days=3)).strftime(
+    "%Y-%m-%dT%H:%M:%S")
 
 GIT_ENV_EXTRA = {
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -172,8 +179,8 @@ def make_fixture_repo(dest: Path) -> Path:
 
     Known state when done:
     - branch ``feature/handoff-fixture``
-    - 1 old commit (2026-10-11, outside the default 12h window) and
-      2 recent commits (inside any sane window)
+    - 1 old commit (3 days before build time, outside the default
+      12h window) and 2 recent commits (inside any sane window)
     - 1 staged modification (CHANGELOG.md)
     - 1 unstaged modification (README.md)
     - 1 untracked file (scratch.py)

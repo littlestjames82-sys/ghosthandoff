@@ -4,6 +4,15 @@ Read-only by construction: the only subcommands used are rev-parse,
 status, log, diff (stat/name-only), ls-files, and stash list, and every
 invocation passes ``--no-optional-locks`` (plus GIT_OPTIONAL_LOCKS=0)
 so git itself does not write back to the index while reporting.
+
+Main entry points:
+
+- :func:`resolve_window` turns a ``--since`` value into a session
+  window (default: last 12 hours).
+- :func:`collect_git` gathers branch, status, window commits, diff
+  stats, ahead/behind, and stash facts into one dict.
+- :func:`list_project_files` defines the file universe the marker
+  scan runs over.
 """
 from __future__ import annotations
 
@@ -82,14 +91,17 @@ def resolve_window(project: str, since: str | None, now: datetime) -> dict:
             "git_since": since.strip(),
             "ref": None,
         }
-    rc, _ = run_git(project, ["rev-parse", "--verify", "--quiet", f"{since}^{{commit}}"])
-    if rc == 0:
-        return {
-            "kind": "ref",
-            "description": f"commits in {since}..HEAD (from --since) plus all uncommitted changes",
-            "git_since": None,
-            "ref": since,
-        }
+    # A value starting with "-" is never probed as a ref: handed to git
+    # it would be parsed as an option, not a revision.
+    if not since.strip().startswith("-"):
+        rc, _ = run_git(project, ["rev-parse", "--verify", "--quiet", f"{since}^{{commit}}"])
+        if rc == 0:
+            return {
+                "kind": "ref",
+                "description": f"commits in {since}..HEAD (from --since) plus all uncommitted changes",
+                "git_since": None,
+                "ref": since,
+            }
     # Unrecognised value: hand it to git as a --since argument and let the
     # log call report emptiness; description stays honest about the source.
     return {
@@ -100,7 +112,89 @@ def resolve_window(project: str, since: str | None, now: datetime) -> dict:
     }
 
 
+_HEX_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _read_marker_file(path: str) -> str:
+    """First line of a git-dir marker file, or "" when unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readline().strip()
+    except OSError:
+        return ""
+
+
+def _git_dir(project: str) -> str:
+    """Absolute path of the repo's git dir (per-worktree dir included).
+
+    Resolved with the read-only ``rev-parse --git-dir`` so linked
+    worktrees report the directory that actually holds their operation
+    markers. Falls back to ``<project>/.git`` when it is a directory.
+    """
+    rc, out = run_git(project, ["rev-parse", "--git-dir"])
+    if rc == 0 and out.strip():
+        gd = out.strip()
+        if not os.path.isabs(gd):
+            gd = os.path.normpath(os.path.join(project, gd))
+        return gd
+    fallback = os.path.join(project, ".git")
+    return fallback if os.path.isdir(fallback) else ""
+
+
+def detect_operations(project: str) -> list[dict]:
+    """In-progress git operations, from git-dir marker files only.
+
+    Git records an unfinished operation as marker state inside the git
+    dir: ``MERGE_HEAD`` for a merge, a ``rebase-merge`` / ``rebase-apply``
+    directory for a rebase, ``CHERRY_PICK_HEAD``, ``REVERT_HEAD``, and
+    ``BISECT_LOG``. Their presence is a repo fact, read here as plain
+    files (no git command runs, nothing is written). Each entry names
+    the marker as its source. A marker left behind by a crashed git
+    process reads as in-progress; the pack states the detection method
+    in its limits so a reader can judge.
+    """
+    gd = _git_dir(project)
+    if not gd:
+        return []
+    ops: list[dict] = []
+
+    for dirname in ("rebase-merge", "rebase-apply"):
+        full = os.path.join(gd, dirname)
+        if os.path.isdir(full):
+            entry = {"operation": "rebase", "source": f".git/{dirname}"}
+            head_name = _read_marker_file(os.path.join(full, "head-name"))
+            if head_name:
+                from .redact import clean_line
+                entry["branch"] = clean_line(
+                    head_name.removeprefix("refs/heads/"), 120)
+            onto = _read_marker_file(os.path.join(full, "onto"))
+            if _HEX_RE.match(onto):
+                entry["onto"] = onto
+            ops.append(entry)
+            break
+
+    for filename, operation in (("MERGE_HEAD", "merge"),
+                                ("CHERRY_PICK_HEAD", "cherry-pick"),
+                                ("REVERT_HEAD", "revert")):
+        full = os.path.join(gd, filename)
+        if os.path.isfile(full):
+            entry = {"operation": operation, "source": f".git/{filename}"}
+            head = _read_marker_file(full)
+            if _HEX_RE.match(head):
+                entry["head"] = head
+            ops.append(entry)
+
+    if os.path.isfile(os.path.join(gd, "BISECT_LOG")):
+        ops.append({"operation": "bisect", "source": ".git/BISECT_LOG"})
+    return ops
+
+
 def _parse_shortstat(text: str) -> dict:
+    """Parse ``git diff --shortstat`` output into counts.
+
+    Returns ``{"files_changed", "insertions", "deletions"}``, all
+    zero when the text is empty or unrecognised (a clean diff).
+    """
     out = {"files_changed": 0, "insertions": 0, "deletions": 0}
     m = re.search(r"(\d+) files? changed", text)
     if m:
@@ -115,6 +209,11 @@ def _parse_shortstat(text: str) -> dict:
 
 
 def _log_args(window: dict, extra: list[str]) -> list[str]:
+    """Build a ``git log`` argument list scoped to ``window``.
+
+    A ref window becomes a ``ref..HEAD`` range; a time window becomes
+    a ``--since=...`` argument appended after ``extra``.
+    """
     args = ["log"]
     if window["kind"] == "ref":
         args.append(f"{window['ref']}..HEAD")
@@ -126,7 +225,19 @@ def _log_args(window: dict, extra: list[str]) -> list[str]:
 
 def collect_git(project: str, window: dict, base: str | None,
                 max_commits: int = 100, max_files: int = 200) -> dict:
-    """Collect every git fact the pack uses. Never writes to the project."""
+    """Collect every git fact the pack uses. Never writes to the project.
+
+    Returns ``{"available": False, "reason": ...}`` when ``project``
+    is not a git work tree (or git is missing); the pack still builds
+    with the git section marked unavailable. Otherwise returns a dict
+    with ``branch`` / ``detached`` / ``upstream``, ``status`` (staged,
+    unstaged, and untracked lists plus counts), ``ahead`` / ``behind``
+    (``None`` when there is no upstream), window ``commits`` with a
+    truncation flag, staged / unstaged ``diff_*`` stats, an optional
+    ``diff_base``, the union of session-touched files, and ``stash``.
+    Commit and file lists are capped at ``max_commits`` /
+    ``max_files``; the caps are flagged in the result, never silent.
+    """
     rc, _ = run_git(project, ["rev-parse", "--is-inside-work-tree"])
     if rc != 0:
         return {"available": False, "reason": "not a git work tree (or git not on PATH)"}
@@ -142,6 +253,7 @@ def collect_git(project: str, window: dict, base: str | None,
     staged: list[str] = []
     unstaged: list[str] = []
     untracked: list[str] = []
+    unmerged: list[str] = []
     branch = ""
     upstream = None
     detached = False
@@ -159,6 +271,12 @@ def collect_git(project: str, window: dict, base: str | None,
                 if head_line.startswith("HEAD"):
                     detached = True
                     branch = "HEAD (detached)"
+                elif head_line.startswith("No commits yet on "):
+                    # Fresh repo: the header is a sentence, the branch
+                    # name is only its tail.
+                    branch = head_line[len("No commits yet on "):].strip()
+                elif head_line.startswith("Initial commit on "):
+                    branch = head_line[len("Initial commit on "):].strip()
                 else:
                     branch = head_line.split("...")[0].strip()
                     if "..." in head_line:
@@ -175,6 +293,12 @@ def collect_git(project: str, window: dict, base: str | None,
             if x == "?" and y == "?":
                 untracked.append(path)
                 continue
+            if x == "U" or y == "U" or (x, y) in (("A", "A"), ("D", "D")):
+                # Unmerged (conflicted) path: it is neither cleanly
+                # staged nor cleanly unstaged, so it is reported in
+                # its own list instead of being double-counted.
+                unmerged.append(path)
+                continue
             if x not in " !":
                 staged.append(path)
             if y not in " !":
@@ -186,10 +310,16 @@ def collect_git(project: str, window: dict, base: str | None,
         "staged": staged,
         "unstaged": unstaged,
         "untracked": untracked,
+        "unmerged": unmerged,
         "staged_count": len(staged),
         "unstaged_count": len(unstaged),
         "untracked_count": len(untracked),
+        "unmerged_count": len(unmerged),
     }
+
+    # --- in-progress operations (git-dir marker files) ------------------
+    facts["operations"] = detect_operations(project)
+    facts["operation_count"] = len(facts["operations"])
 
     # --- ahead / behind -------------------------------------------------
     facts["ahead"] = None
@@ -221,7 +351,7 @@ def collect_git(project: str, window: dict, base: str | None,
                 "hash": parts[0],
                 "short": parts[1],
                 "subject": clean_line(parts[2], 200),
-                "author": parts[3],
+                "author": clean_line(parts[3], 80),
                 "time": parts[4],
             })
     facts["commits_truncated"] = len(commits) > max_commits
@@ -250,15 +380,23 @@ def collect_git(project: str, window: dict, base: str | None,
     facts["diff_staged"] = _parse_shortstat(out if rc == 0 else "")
 
     facts["diff_base"] = None
-    if base:
-        rc, out = run_git(project, ["diff", "--shortstat", f"{base}...HEAD"])
+    if base and not base.startswith("-"):
+        # The base is caller-supplied and lands inside a git argv slot.
+        # A value shaped like an option (e.g. --output=<path>) would be
+        # parsed by git as an option and can make diff WRITE a file, so
+        # the value only reaches the diff call once it verifies as a
+        # real commit; anything else simply yields no base diff, the
+        # same outcome an unresolvable base already produced.
+        rc, _ = run_git(project, ["rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"])
         if rc == 0:
-            facts["diff_base"] = {"base": base, **_parse_shortstat(out)}
+            rc, out = run_git(project, ["diff", "--shortstat", f"{base}...HEAD"])
+            if rc == 0:
+                facts["diff_base"] = {"base": base, **_parse_shortstat(out)}
 
     # union of session-touched files
     union: list[str] = []
     seen = set()
-    for src in (commit_files, staged, unstaged, untracked):
+    for src in (commit_files, staged, unstaged, untracked, unmerged):
         for p in src:
             if p not in seen:
                 seen.add(p)

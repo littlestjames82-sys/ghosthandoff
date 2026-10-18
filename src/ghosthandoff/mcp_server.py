@@ -1,11 +1,19 @@
 """Stdio MCP server for GhostHandoff. Local only, no network.
 
+Run it with ``ghosthandoff mcp``; it speaks newline-delimited
+JSON-RPC on stdin/stdout and handles ``initialize``, ``ping``,
+``tools/list``, and ``tools/call``.
+
 Tools:
 - build_handoff: build a pack, return capped summary counts + pack paths.
+  Arguments: ``project`` (required), ``out``, ``since``, ``base``.
 - read_handoff: return a pack's HANDOFF.md, capped at 8000 characters.
+  Argument: ``pack_dir`` (required).
 
 Payloads never include project file bodies; HANDOFF.md is itself the
-capped, redacted, extractive summary.
+capped, redacted, extractive summary. Building a pack through MCP
+follows the same rules as the CLI: propose-only, writes only the two
+pack files into the output directory.
 """
 from __future__ import annotations
 
@@ -62,6 +70,12 @@ def _text_result(text: str, is_error: bool = False) -> dict:
 
 
 def _call_tool(name: str, arguments: dict) -> dict:
+    """Dispatch one MCP tool call and return its text result payload.
+
+    Unknown tools, a missing project directory, and an unwritable
+    pack all come back as error results (``isError``) rather than
+    exceptions, so the client session stays alive.
+    """
     if name == "build_handoff":
         project = arguments.get("project", "")
         if not os.path.isdir(project):
@@ -98,6 +112,7 @@ def _call_tool(name: str, arguments: dict) -> dict:
 
 
 def handle(request: dict) -> dict | None:
+    """Handle one JSON-RPC request dict; ``None`` means no reply (notification)."""
     method = request.get("method", "")
     req_id = request.get("id")
     if method == "initialize":
@@ -114,13 +129,25 @@ def handle(request: dict) -> dict | None:
         return _result(req_id, {"tools": TOOLS})
     if method == "tools/call":
         params = request.get("params") or {}
-        return _result(req_id, _call_tool(params.get("name", ""), params.get("arguments") or {}))
+        if not isinstance(params, dict):
+            params = {}
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        try:
+            return _result(req_id, _call_tool(params.get("name", ""), arguments))
+        except Exception as exc:
+            # One malformed call must not kill the server: answer it
+            # with an error result and keep serving later requests.
+            return _result(req_id, _text_result(
+                f"tool call failed: {exc}", is_error=True))
     if req_id is not None:
         return _error(req_id, -32601, f"method not found: {method}")
     return None
 
 
 def serve(stdin=None, stdout=None) -> None:
+    """Serve newline-delimited JSON-RPC until stdin reaches EOF."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     for line in stdin:
@@ -131,6 +158,8 @@ def serve(stdin=None, stdout=None) -> None:
             request = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(request, dict):
+            continue  # valid JSON, but not a request object: skip it
         response = handle(request)
         if response is not None:
             stdout.write(json.dumps(response) + "\n")
