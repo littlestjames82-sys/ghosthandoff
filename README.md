@@ -1,5 +1,6 @@
 # GhostHandoff
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/littlestjames82-sys/ghosthandoff/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghosthandoff/actions/workflows/ci.yml/actions)
 
 A session handoff pack for GhostSlice projects. When a working
 session stops, GhostHandoff writes one small pack that says where
