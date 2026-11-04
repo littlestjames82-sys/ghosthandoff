@@ -1,4 +1,5 @@
 # GhostHandoff
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A session handoff pack for GhostSlice projects. When a working
 session stops, GhostHandoff writes one small pack that says where
@@ -259,3 +260,16 @@ python3 -m pytest tests -q
 See `examples/` for a walkthrough that builds a fixture repo in a
 known mid-session state and packs it. See `PLAN.md` for the full
 design and the verification bar the test suite pins.
+
+---
+<!-- ghost-studio-footer -->
+## More from Ghost Developer Studio
+
+Ghost Developer Studio builds developer tools, AI-agent safety software, and practical apps, and sells by showing working software, not slide decks.
+
+- [Roadmap board](https://github.com/littlestjames82-sys/ghost-roadmaps): where every studio product stands
+- [Agent Seatbelt](https://github.com/littlestjames82-sys/agent-seatbelt): deterministic guardrails for AI coding agents
+- [Ghost Hands](https://github.com/littlestjames82-sys/ghost-hands): governed, recorded, replayable agent hands
+- [GhostSlice](https://github.com/littlestjames82-sys/ghostslice): agent context and prompt optimizer
+- [GhostIDE](https://github.com/littlestjames82-sys/ghostide-android): fully offline AI code editor for Android
+- [All studio projects](https://github.com/littlestjames82-sys?tab=repositories)
